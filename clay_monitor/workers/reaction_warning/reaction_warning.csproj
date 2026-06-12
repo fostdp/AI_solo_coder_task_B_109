@@ -7,6 +7,6 @@
     <AssemblyName>reaction_warning</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\ClayMonitor.Core\ClayMonitor.Core.csproj" />
+    <ProjectReference Include="..\ClayMonitor.Core\ClayMonitor.Core.csproj" />
   </ItemGroup>
 </Project>
