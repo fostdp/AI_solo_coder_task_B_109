@@ -4,6 +4,7 @@ using ClayMonitor.Core.Messages;
 using ClayMonitor.Core.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using SkiaSharp;
 using WashburnPenetration;
 using WashburnPenetration.Models;
 
@@ -290,63 +291,206 @@ public class VirtualCoatingWorker : BackgroundService, IVirtualCoatingService
     public async Task<byte[]> RenderImageAsync(VirtualCoatingInput input, CancellationToken ct = default)
     {
         var result = await SimulateAsync(input, ct);
+        return RenderSkiaSharpImage(result, input, 800, 600);
+    }
 
-        int width = 512;
-        int height = 384;
-        var pixels = new byte[width * height * 3];
+    public byte[] RenderSkiaSharpImage(VirtualCoatingResult result, VirtualCoatingInput input, int width = 800, int height = 600)
+    {
+        using var surface = SKSurface.Create(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul));
+        var canvas = surface.Canvas;
+        canvas.Clear(new SKColor(245, 243, 238));
 
-        double[] depthProfile = result.DepthProfile;
-        double maxDepth = depthProfile.Length > 0 ? depthProfile.Max() : 1.0;
+        int marginLeft = 90;
+        int marginRight = 120;
+        int marginTop = 80;
+        int marginBottom = 100;
+        int plotWidth = width - marginLeft - marginRight;
+        int plotHeight = height - marginTop - marginBottom;
 
-        for (int y = 0; y < height; y++)
+        double maxDepth = Math.Max(result.MaximumPenetrationDepthMm, 1.0);
+        double widthCm = input.SculptureWidthCm;
+
+        using var paintBg = new SKPaint { Color = new SKColor(235, 228, 218), IsAntialias = true };
+        canvas.DrawRoundRect(marginLeft, marginTop, plotWidth, plotHeight, 8, 8, paintBg);
+
+        int resolution = 100;
+        for (int py = 0; py < resolution; py++)
         {
-            for (int x = 0; x < width; x++)
+            double depthRatio = py / (double)(resolution - 1);
+            double depth = depthRatio * maxDepth;
+            double depthFactor = Math.Exp(-1.2 * depth / Math.Max(maxDepth, 0.1));
+
+            for (int px = 0; px < resolution; px++)
             {
-                int idx = (y * width + x) * 3;
+                double xRatio = px / (double)(resolution - 1);
+                double distFromCenter = Math.Abs((xRatio - 0.5) * 2.0);
+                double edgeFactor = Math.Exp(-1.5 * distFromCenter * distFromCenter);
+                double concentration = depthFactor * (0.7 + 0.6 * edgeFactor);
 
-                double nx = x / (double)(width - 1);
-                double ny = y / (double)(height - 1);
+                SKColor color = ViridisColorMap(concentration);
+                using var p = new SKPaint { Color = color, IsAntialias = false };
 
-                double depthFactor = ny < 0.5
-                    ? 1.0 - (ny * 2.0)
-                    : 0.0;
-
-                double horizontalFactor = Math.Exp(-Math.Pow((nx - 0.5) * 3.0, 2));
-
-                double concentration = depthFactor * horizontalFactor;
-
-                int r, g, b;
-                if (concentration > 0.7)
-                {
-                    r = (int)(255 * concentration);
-                    g = (int)(200 * concentration);
-                    b = 100;
-                }
-                else if (concentration > 0.3)
-                {
-                    r = (int)(100 + 155 * concentration);
-                    g = (int)(150 + 105 * concentration);
-                    b = (int)(80 + 120 * concentration);
-                }
-                else
-                {
-                    r = (int)(180 + 75 * concentration);
-                    g = (int)(160 + 95 * concentration);
-                    b = (int)(140 + 115 * concentration);
-                }
-
-                pixels[idx] = (byte)Math.Clamp(r, 0, 255);
-                pixels[idx + 1] = (byte)Math.Clamp(g, 0, 255);
-                pixels[idx + 2] = (byte)Math.Clamp(b, 0, 255);
+                float rx = marginLeft + (float)xRatio * plotWidth;
+                float ry = marginTop + (float)depthRatio * plotHeight;
+                float cellW = plotWidth / resolution + 1;
+                float cellH = plotHeight / resolution + 1;
+                canvas.DrawRect(rx, ry, cellW, cellH, p);
             }
         }
 
-        byte[] bmpHeader = GenerateBmpHeader(width, height, pixels.Length);
-        byte[] imageData = new byte[bmpHeader.Length + pixels.Length];
-        Buffer.BlockCopy(bmpHeader, 0, imageData, 0, bmpHeader.Length);
-        Buffer.BlockCopy(pixels, 0, imageData, bmpHeader.Length, pixels.Length);
+        using (var isoPaint = new SKPaint
+               {
+                   Color = new SKColor(255, 255, 255, 220),
+                   StrokeWidth = 1.5f,
+                   IsStroke = true,
+                   PathEffect = SKPathEffect.CreateDash(new float[] { 6, 4 }, 0),
+                   IsAntialias = true
+               })
+        {
+            double[] isoLevels = { 0.9, 0.7, 0.5, 0.3, 0.1 };
+            string[] labels = { "90%", "70%", "50%", "30%", "10%" };
+            for (int i = 0; i < isoLevels.Length && i < result.IsoSurfaces.Length; i++)
+            {
+                double isoDepth = result.IsoSurfaces[i];
+                float y = marginTop + (float)(isoDepth / maxDepth) * plotHeight;
+                if (y >= marginTop && y <= marginTop + plotHeight)
+                {
+                    canvas.DrawLine(marginLeft, y, marginLeft + plotWidth, y, isoPaint);
+                    using var txtPaint = new SKPaint
+                    {
+                        Color = new SKColor(255, 255, 255),
+                        TextSize = 10,
+                        IsAntialias = true,
+                        FakeBoldText = true
+                    };
+                    canvas.DrawText(labels[i], marginLeft + plotWidth - 30, y - 3, txtPaint);
+                }
+            }
+        }
 
-        return imageData;
+        using (var axisPaint = new SKPaint
+               {
+                   Color = new SKColor(60, 60, 60),
+                   StrokeWidth = 1.5f,
+                   IsStroke = true,
+                   IsAntialias = true
+               })
+        {
+            canvas.DrawLine(marginLeft, marginTop, marginLeft, marginTop + plotHeight, axisPaint);
+            canvas.DrawLine(marginLeft, marginTop + plotHeight, marginLeft + plotWidth, marginTop + plotHeight, axisPaint);
+        }
+
+        using (var labelPaint = new SKPaint
+               {
+                   Color = new SKColor(40, 40, 40),
+                   TextSize = 12,
+                   IsAntialias = true,
+                   TextAlign = SKTextAlign.Center
+               })
+        {
+            canvas.DrawText("Width (cm)", marginLeft + plotWidth / 2, height - 50, labelPaint);
+            labelPaint.TextAlign = SKTextAlign.Left;
+            canvas.Save();
+            canvas.Translate(25, marginTop + plotHeight / 2);
+            canvas.RotateDegrees(-90);
+            canvas.DrawText("Depth (mm)", 0, 0, labelPaint);
+            canvas.Restore();
+
+            for (int i = 0; i <= 5; i++)
+            {
+                float xRatio = i / 5.0f;
+                float x = marginLeft + xRatio * plotWidth;
+                canvas.DrawLine(x, marginTop + plotHeight, x, marginTop + plotHeight + 5, axisPaint);
+                labelPaint.TextAlign = SKTextAlign.Center;
+                canvas.DrawText($"{(xRatio * widthCm):F0}", x, marginTop + plotHeight + 20, labelPaint);
+            }
+            for (int i = 0; i <= 5; i++)
+            {
+                float yRatio = i / 5.0f;
+                float y = marginTop + yRatio * plotHeight;
+                canvas.DrawLine(marginLeft - 5, y, marginLeft, y, axisPaint);
+                labelPaint.TextAlign = SKTextAlign.Right;
+                canvas.DrawText($"{(yRatio * maxDepth):F1}", marginLeft - 8, y + 4, labelPaint);
+            }
+        }
+
+        using (var titlePaint = new SKPaint
+               {
+                   Color = new SKColor(30, 30, 30),
+                   TextSize = 18,
+                   IsAntialias = true,
+                   FakeBoldText = true
+               })
+        {
+            canvas.DrawText($"Virtual Coating - {result.MaterialName}", marginLeft, 35, titlePaint);
+        }
+
+        using (var infoPaint = new SKPaint
+               {
+                   Color = new SKColor(60, 60, 60),
+                   TextSize = 11,
+                   IsAntialias = true
+               })
+        {
+            int infoY = marginTop;
+            canvas.DrawText($"Avg Penetration: {result.AveragePenetrationDepthMm:F2} mm", marginLeft + plotWidth + 10, infoY + 15, infoPaint);
+            canvas.DrawText($"Max Penetration: {result.MaximumPenetrationDepthMm:F2} mm", marginLeft + plotWidth + 10, infoY + 32, infoPaint);
+            canvas.DrawText($"Gloss Change: {result.GlossChangePercent:F1}%", marginLeft + plotWidth + 10, infoY + 49, infoPaint);
+            canvas.DrawText($"Reinforced Vol: {result.ReinforcedVolumePercent:F1}%", marginLeft + plotWidth + 10, infoY + 66, infoPaint);
+            canvas.DrawText($"Hardness +{result.HardnessImprovementPercent:F0}%", marginLeft + plotWidth + 10, infoY + 83, infoPaint);
+
+            int legendY = infoY + 120;
+            int legendH = 160;
+            int legendW = 20;
+            using var legendBg = new SKPaint { Color = new SKColor(255, 255, 255, 230), IsAntialias = true };
+            canvas.DrawRoundRect(marginLeft + plotWidth + 5, legendY - 5, legendW + 60, legendH + 20, 4, 4, legendBg);
+
+            for (int i = 0; i < 100; i++)
+            {
+                double t = i / 99.0;
+                SKColor c = ViridisColorMap(1.0 - t);
+                using var lp = new SKPaint { Color = c };
+                canvas.DrawRect(marginLeft + plotWidth + 10, legendY + (float)(t * legendH), legendW, legendH / 100.0f + 1, lp);
+            }
+            infoPaint.TextAlign = SKTextAlign.Left;
+            canvas.DrawText("High", marginLeft + plotWidth + 35, legendY + 10, infoPaint);
+            canvas.DrawText("Low", marginLeft + plotWidth + 35, legendY + legendH, infoPaint);
+            canvas.DrawText("Conc.", marginLeft + plotWidth + 35, legendY + legendH / 2 + 5, infoPaint);
+        }
+
+        if (result.EnhancementSuggestions.Length > 0)
+        {
+            using var sugPaint = new SKPaint
+            {
+                Color = new SKColor(50, 50, 50),
+                TextSize = 10,
+                IsAntialias = true
+            };
+            string firstSuggestion = result.EnhancementSuggestions[0];
+            if (firstSuggestion.Length > 100) firstSuggestion = firstSuggestion.Substring(0, 97) + "...";
+            canvas.DrawText($"Tip: {firstSuggestion}", marginLeft, height - 20, sugPaint);
+        }
+
+        using var image = surface.Snapshot();
+        using var data = image.Encode(SKEncodedImageFormat.Png, 95);
+        return data.ToArray();
+    }
+
+    private static SKColor ViridisColorMap(double t)
+    {
+        t = Math.Clamp(t, 0.0, 1.0);
+        double[] r = { 0.267, 0.282, 0.254, 0.206, 0.163, 0.127, 0.135, 0.266, 0.477, 0.741, 0.993 };
+        double[] g = { 0.004, 0.140, 0.305, 0.436, 0.557, 0.658, 0.749, 0.821, 0.861, 0.863, 0.906 };
+        double[] b = { 0.329, 0.463, 0.524, 0.554, 0.568, 0.559, 0.518, 0.441, 0.326, 0.182, 0.144 };
+        int n = r.Length - 1;
+        double idx = t * n;
+        int i = (int)Math.Floor(idx);
+        double f = idx - i;
+        if (i >= n) { i = n - 1; f = 1.0; }
+        byte R = (byte)Math.Round((r[i] + f * (r[i + 1] - r[i])) * 255);
+        byte G = (byte)Math.Round((g[i] + f * (g[i + 1] - g[i])) * 255);
+        byte B = (byte)Math.Round((b[i] + f * (b[i + 1] - b[i])) * 255);
+        return new SKColor(R, G, B, 255);
     }
 
     private byte[] GenerateBmpHeader(int width, int height, int pixelDataSize)
