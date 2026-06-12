@@ -53,6 +53,37 @@ public record ReactionWarning
     public DateTime TriggeredAt { get; init; } = DateTime.Now;
 }
 
+public record ThermodynamicLookupKey : IEquatable<ThermodynamicLookupKey>
+{
+    public string ReactionKey { get; init; } = string.Empty;
+    public int TemperatureC { get; init; }
+    public int PHx10 { get; init; }
+    public int HumidityPct { get; init; }
+
+    public bool Equals(ThermodynamicLookupKey? other)
+    {
+        if (other is null) return false;
+        return ReactionKey == other.ReactionKey
+               && TemperatureC == other.TemperatureC
+               && PHx10 == other.PHx10
+               && HumidityPct == other.HumidityPct;
+    }
+
+    public override bool Equals(object? obj) => Equals(obj as ThermodynamicLookupKey);
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(ReactionKey, TemperatureC, PHx10, HumidityPct);
+    }
+}
+
+public record ThermodynamicCachedValues
+{
+    public double DeltaGkJmol { get; init; }
+    public double EquilibriumConstant { get; init; }
+    public double RateConstant { get; init; }
+}
+
 public interface IChemicalReactionService
 {
     Task<ReactionResult> EvaluateReactionAsync(ReactionInput input, CancellationToken ct = default);
@@ -64,12 +95,17 @@ public interface IChemicalReactionService
     double CalculateGibbsFreeEnergy(double deltaH, double deltaS, double temperatureK);
     double CalculateArrheniusRate(double A, double Ea, double temperatureK);
     double CalculateReactionQuotient(double[] products, double[] reactants);
+    bool TryGetCachedThermodynamics(ThermodynamicLookupKey key, out ThermodynamicCachedValues values);
+    int GetCacheHitCount();
+    int GetCacheSize();
 }
 
 public class ChemicalReactionService : BackgroundService, IChemicalReactionService
 {
     private readonly IMessageBus _bus;
     private readonly ChemicalReactionOptions _options;
+    private readonly Dictionary<ThermodynamicLookupKey, ThermodynamicCachedValues> _thermoCache;
+    private int _cacheHitCount;
 
     private static readonly Dictionary<string, ChemicalReactionModel> ReactionDatabase = new()
     {
@@ -147,6 +183,104 @@ public class ChemicalReactionService : BackgroundService, IChemicalReactionServi
     {
         _bus = bus;
         _options = options.Value;
+        _thermoCache = new Dictionary<ThermodynamicLookupKey, ThermodynamicCachedValues>();
+        _cacheHitCount = 0;
+        PrecomputeThermodynamicCache();
+    }
+
+    private void PrecomputeThermodynamicCache()
+    {
+        double[] temperaturesC = { 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50 };
+        double[] phValues = { 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0 };
+        double[] humidities = { 0.3, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9 };
+        double R = 8.314;
+
+        foreach (var reactionKvp in ReactionDatabase)
+        {
+            string reactionKey = reactionKvp.Key;
+            var reaction = reactionKvp.Value;
+
+            foreach (double tC in temperaturesC)
+            {
+                double T = tC + 273.15;
+                double deltaG = CalculateGibbsFreeEnergy(
+                    reaction.DeltaHkJmol * 1000, reaction.DeltaSJmolK, T) / 1000.0;
+                double K = Math.Exp(-deltaG * 1000 / (R * T));
+                double baseRate = CalculateArrheniusRate(
+                    reaction.PreExponentialFactor, reaction.ActivationEnergyKJmol * 1000, T);
+
+                foreach (double ph in phValues)
+                {
+                    double phFactor = 1.0 + 0.5 * Math.Abs(ph - 7.0);
+
+                    foreach (double rh in humidities)
+                    {
+                        double humidityFactor = 1.0 + 2.0 * Math.Max(0, rh - 0.6);
+                        double adjustedRate = baseRate * phFactor * humidityFactor;
+
+                        var key = new ThermodynamicLookupKey
+                        {
+                            ReactionKey = reactionKey,
+                            TemperatureC = (int)Math.Round(tC),
+                            PHx10 = (int)Math.Round(ph * 10),
+                            HumidityPct = (int)Math.Round(rh * 100)
+                        };
+
+                        _thermoCache[key] = new ThermodynamicCachedValues
+                        {
+                            DeltaGkJmol = deltaG,
+                            EquilibriumConstant = K,
+                            RateConstant = adjustedRate
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    public bool TryGetCachedThermodynamics(ThermodynamicLookupKey key, out ThermodynamicCachedValues values)
+    {
+        bool hit = _thermoCache.TryGetValue(key, out values!);
+        if (hit) Interlocked.Increment(ref _cacheHitCount);
+        return hit;
+    }
+
+    public int GetCacheHitCount() => _cacheHitCount;
+    public int GetCacheSize() => _thermoCache.Count;
+
+    private ThermodynamicCachedValues GetOrComputeThermodynamics(
+        string reactionKey, ChemicalReactionModel reaction, double temperatureC, double pH, double rh)
+    {
+        var lookupKey = new ThermodynamicLookupKey
+        {
+            ReactionKey = reactionKey,
+            TemperatureC = (int)Math.Round(Math.Clamp(temperatureC, 0, 50) / 5) * 5,
+            PHx10 = (int)Math.Round(Math.Clamp(pH, 5.0, 9.0) * 2) * 5,
+            HumidityPct = (int)Math.Round(Math.Clamp(rh, 0.3, 0.9) * 10) * 10
+        };
+
+        if (_thermoCache.TryGetValue(lookupKey, out var cached))
+        {
+            Interlocked.Increment(ref _cacheHitCount);
+            return cached;
+        }
+
+        double R = 8.314;
+        double T = temperatureC + 273.15;
+        double deltaG = CalculateGibbsFreeEnergy(
+            reaction.DeltaHkJmol * 1000, reaction.DeltaSJmolK, T) / 1000.0;
+        double K = Math.Exp(-deltaG * 1000 / (R * T));
+        double baseRate = CalculateArrheniusRate(
+            reaction.PreExponentialFactor, reaction.ActivationEnergyKJmol * 1000, T);
+        double phFactor = 1.0 + 0.5 * Math.Abs(pH - 7.0);
+        double humidityFactor = 1.0 + 2.0 * Math.Max(0, rh - 0.6);
+
+        return new ThermodynamicCachedValues
+        {
+            DeltaGkJmol = deltaG,
+            EquilibriumConstant = K,
+            RateConstant = baseRate * phFactor * humidityFactor
+        };
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -260,21 +394,12 @@ public class ChemicalReactionService : BackgroundService, IChemicalReactionServi
             });
         }
 
-        double T = input.TemperatureC + 273.15;
-        double R = 8.314;
+        var thermo = GetOrComputeThermodynamics(reactionKey, reaction, input.TemperatureC, input.pH, input.RelativeHumidity);
 
-        double deltaG = CalculateGibbsFreeEnergy(reaction.DeltaHkJmol * 1000, reaction.DeltaSJmolK, T) / 1000.0;
-        double K = Math.Exp(-deltaG * 1000 / (R * T));
+        double deltaG = thermo.DeltaGkJmol;
+        double K = thermo.EquilibriumConstant;
+        double adjustedRate = thermo.RateConstant;
         bool isSpontaneous = deltaG < 0;
-
-        double rateConstant = CalculateArrheniusRate(
-            reaction.PreExponentialFactor,
-            reaction.ActivationEnergyKJmol * 1000,
-            T);
-
-        double pHFactor = 1.0 + 0.5 * Math.Abs(input.pH - 7.0);
-        double humidityFactor = 1.0 + 2.0 * Math.Max(0, input.RelativeHumidity - 0.6);
-        double adjustedRate = rateConstant * pHFactor * humidityFactor;
 
         double reactionRate = adjustedRate *
             Math.Pow(input.TEOSConcentrationMolL, reaction.ReactionOrder) *
