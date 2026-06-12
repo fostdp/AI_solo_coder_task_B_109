@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>virtual_coating</RootNamespace>
+    <AssemblyName>virtual_coating</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ClayMonitor.Core\ClayMonitor.Core.csproj" />
+    <ProjectReference Include="..\washburn_penetration\washburn_penetration.csproj" />
+  </ItemGroup>
+</Project>
