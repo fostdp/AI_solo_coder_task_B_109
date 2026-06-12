@@ -6,6 +6,15 @@ using Microsoft.Extensions.Options;
 
 namespace ClayMonitor.PenetrationPrediction;
 
+public record SculptureLayer
+{
+    public string LayerName { get; init; } = string.Empty;
+    public double ThicknessMm { get; init; }
+    public double Porosity { get; init; }
+    public double PoreRadiusNm { get; init; }
+    public double Tortuosity { get; init; } = 1.5;
+}
+
 public record PenetrationInput
 {
     public int SculptureId { get; init; }
@@ -17,6 +26,18 @@ public record PenetrationInput
     public double ContactAngleDeg { get; init; }
     public double TimeSeconds { get; init; }
     public double TemperatureC { get; init; } = 25.0;
+    public SculptureLayer[]? Layers { get; init; }
+    public bool UseLayeredModel { get; init; } = false;
+}
+
+public record LayerPenetrationInfo
+{
+    public string LayerName { get; init; } = string.Empty;
+    public double DepthInLayerMm { get; init; }
+    public double TimeToTraverseSeconds { get; init; }
+    public double LayerPorosity { get; init; }
+    public double LayerPoreRadiusNm { get; init; }
+    public bool FullyPenetrated { get; init; }
 }
 
 public record PenetrationResult
@@ -33,6 +54,8 @@ public record PenetrationResult
     public double CapillaryPressurePa { get; init; }
     public double EffectiveDiffusivity { get; init; }
     public DateTime CalculatedAt { get; init; } = DateTime.Now;
+    public bool UsedLayeredModel { get; init; }
+    public LayerPenetrationInfo[] LayerBreakdown { get; init; } = Array.Empty<LayerPenetrationInfo>();
 }
 
 public interface IPenetrationPredictionService
@@ -40,7 +63,9 @@ public interface IPenetrationPredictionService
     Task<PenetrationResult> PredictAsync(PenetrationInput input, CancellationToken ct = default);
     Task<PenetrationResult[]> PredictBatchAsync(PenetrationInput[] inputs, CancellationToken ct = default);
     double CalculateLucasWashburn(double t, double r, double gamma, double theta, double eta, double phi);
+    double CalculateLayeredLucasWashburn(double t, double gamma, double theta, double eta, SculptureLayer[] layers);
     double CalculateCapillaryPressure(double r, double gamma, double theta);
+    SculptureLayer[] GetDefaultClayLayers();
 }
 
 public class PenetrationPredictionService : BackgroundService, IPenetrationPredictionService
@@ -173,8 +198,6 @@ public class PenetrationPredictionService : BackgroundService, IPenetrationPredi
 
     public async Task<PenetrationResult> PredictAsync(PenetrationInput input, CancellationToken ct = default)
     {
-        double phi = input.Porosity;
-        double r = input.PoreRadiusNm * 1e-9;
         double gamma = input.SurfaceTensionNm;
         double theta = input.ContactAngleDeg * Math.PI / 180.0;
         double eta = input.ViscosityPaS;
@@ -183,23 +206,47 @@ public class PenetrationPredictionService : BackgroundService, IPenetrationPredi
         double temperatureFactor = 1.0 + 0.02 * (input.TemperatureC - 25.0);
         eta /= temperatureFactor;
 
+        double phi = input.Porosity;
+        double r = input.PoreRadiusNm * 1e-9;
         double Pc = CalculateCapillaryPressure(r, gamma, theta);
         double Deff = CalculateEffectiveDiffusivity(phi, r, gamma, theta, eta);
-        double depth = CalculateLucasWashburn(t, r, gamma, theta, eta, phi);
+
+        bool useLayered = input.UseLayeredModel && input.Layers != null && input.Layers.Length > 0;
+        SculptureLayer[] layers = useLayered ? input.Layers! : GetDefaultClayLayers();
+
+        double depth;
+        LayerPenetrationInfo[] layerBreakdown;
+        double[] depthProfile;
+        double[] timePoints;
+
+        if (useLayered)
+        {
+            depth = CalculateLayeredLucasWashburn(t, gamma, theta, eta, layers);
+            layerBreakdown = CalculateLayerBreakdown(t, gamma, theta, eta, layers);
+            (depthProfile, timePoints) = GenerateLayeredDepthProfile(t, gamma, theta, eta, layers);
+        }
+        else
+        {
+            depth = CalculateLucasWashburn(t, r, gamma, theta, eta, phi);
+            layerBreakdown = Array.Empty<LayerPenetrationInfo>();
+
+            int timeSteps = 50;
+            timePoints = new double[timeSteps];
+            depthProfile = new double[timeSteps];
+            double timeTo5mm = CalculateTimeToTargetDepth(5.0, r, gamma, theta, eta, phi);
+            double maxTime = Math.Max(t, timeTo5mm * 1.5);
+
+            for (int i = 0; i < timeSteps; i++)
+            {
+                timePoints[i] = (i + 1) * maxTime / timeSteps;
+                depthProfile[i] = CalculateLucasWashburn(timePoints[i], r, gamma, theta, eta, phi);
+            }
+        }
 
         double penetrationRate = t > 0 ? depth / t : 0;
-        double timeTo5mm = CalculateTimeToTargetDepth(5.0, r, gamma, theta, eta, phi);
-
-        int timeSteps = 50;
-        double[] timePoints = new double[timeSteps];
-        double[] depthProfile = new double[timeSteps];
-        double maxTime = Math.Max(t, timeTo5mm * 1.5);
-
-        for (int i = 0; i < timeSteps; i++)
-        {
-            timePoints[i] = (i + 1) * maxTime / timeSteps;
-            depthProfile[i] = CalculateLucasWashburn(timePoints[i], r, gamma, theta, eta, phi);
-        }
+        double timeTo5mmUniform = useLayered
+            ? CalculateLayeredTimeToTargetDepth(5.0, gamma, theta, eta, layers)
+            : CalculateTimeToTargetDepth(5.0, r, gamma, theta, eta, phi);
 
         string grade = ClassifyPenetration(depth);
         string recommendation = GenerateRecommendation(depth, input.MaterialName, phi);
@@ -210,14 +257,16 @@ public class PenetrationPredictionService : BackgroundService, IPenetrationPredi
             MaterialName = input.MaterialName,
             PredictedDepthMm = Math.Round(depth, 4),
             PenetrationRateMmPerS = Math.Round(penetrationRate, 6),
-            TimeToReach5mm = Math.Round(timeTo5mm, 2),
+            TimeToReach5mm = Math.Round(timeTo5mmUniform, 2),
             DepthProfile = depthProfile.Select(x => Math.Round(x, 4)).ToArray(),
             TimePoints = timePoints.Select(x => Math.Round(x, 2)).ToArray(),
             PenetrationGrade = grade,
             Recommendation = recommendation,
             CapillaryPressurePa = Math.Round(Pc, 2),
             EffectiveDiffusivity = Math.Round(Deff, 10),
-            CalculatedAt = DateTime.Now
+            CalculatedAt = DateTime.Now,
+            UsedLayeredModel = useLayered,
+            LayerBreakdown = layerBreakdown
         });
     }
 
@@ -310,6 +359,191 @@ public class PenetrationPredictionService : BackgroundService, IPenetrationPredi
     public static bool TryGetMaterialProperties(string materialName, out MaterialProperties properties)
     {
         return MaterialDatabase.TryGetValue(materialName, out properties!);
+    }
+
+    public SculptureLayer[] GetDefaultClayLayers()
+    {
+        return new[]
+        {
+            new SculptureLayer
+            {
+                LayerName = "彩绘层",
+                ThicknessMm = 0.3,
+                Porosity = 0.15,
+                PoreRadiusNm = 100.0,
+                Tortuosity = 2.5
+            },
+            new SculptureLayer
+            {
+                LayerName = "地仗层",
+                ThicknessMm = 3.0,
+                Porosity = 0.35,
+                PoreRadiusNm = 500.0,
+                Tortuosity = 1.8
+            },
+            new SculptureLayer
+            {
+                LayerName = "胎体层",
+                ThicknessMm = 20.0,
+                Porosity = 0.45,
+                PoreRadiusNm = 1500.0,
+                Tortuosity = 1.4
+            }
+        };
+    }
+
+    public double CalculateLayeredLucasWashburn(double t, double gamma, double theta, double eta, SculptureLayer[] layers)
+    {
+        if (t <= 0 || layers.Length == 0) return 0;
+
+        double cosTheta = Math.Cos(theta);
+        if (cosTheta <= 0) return 0;
+
+        double remainingTime = t;
+        double totalDepth = 0;
+
+        foreach (var layer in layers)
+        {
+            double r = layer.PoreRadiusNm * 1e-9;
+            double phi = layer.Porosity;
+            double tau = layer.Tortuosity;
+            double layerThicknessM = layer.ThicknessMm / 1000.0;
+
+            double numerator = gamma * cosTheta * r;
+            double denominator = 2.0 * eta * phi * tau;
+            double kEffective = numerator / denominator;
+
+            double timeToTraverseLayer = (layerThicknessM * layerThicknessM) / Math.Max(kEffective, 1e-20);
+
+            if (remainingTime >= timeToTraverseLayer)
+            {
+                totalDepth += layer.ThicknessMm;
+                remainingTime -= timeToTraverseLayer;
+            }
+            else
+            {
+                double partialDepthM = Math.Sqrt(kEffective * remainingTime);
+                totalDepth += partialDepthM * 1000.0;
+                remainingTime = 0;
+                break;
+            }
+        }
+
+        return totalDepth;
+    }
+
+    private LayerPenetrationInfo[] CalculateLayerBreakdown(double t, double gamma, double theta, double eta, SculptureLayer[] layers)
+    {
+        if (layers.Length == 0) return Array.Empty<LayerPenetrationInfo>();
+
+        double cosTheta = Math.Cos(theta);
+        if (cosTheta <= 0) return layers.Select(l => new LayerPenetrationInfo
+        {
+            LayerName = l.LayerName,
+            DepthInLayerMm = 0,
+            TimeToTraverseSeconds = double.PositiveInfinity,
+            LayerPorosity = l.Porosity,
+            LayerPoreRadiusNm = l.PoreRadiusNm,
+            FullyPenetrated = false
+        }).ToArray();
+
+        var result = new List<LayerPenetrationInfo>();
+        double remainingTime = t;
+
+        foreach (var layer in layers)
+        {
+            double r = layer.PoreRadiusNm * 1e-9;
+            double phi = layer.Porosity;
+            double tau = layer.Tortuosity;
+            double layerThicknessM = layer.ThicknessMm / 1000.0;
+
+            double numerator = gamma * cosTheta * r;
+            double denominator = 2.0 * eta * phi * tau;
+            double kEffective = numerator / Math.Max(denominator, 1e-20);
+
+            double timeToTraverse = (layerThicknessM * layerThicknessM) / Math.Max(kEffective, 1e-20);
+
+            double depthInLayer;
+            bool fullyPenetrated;
+
+            if (remainingTime >= timeToTraverse)
+            {
+                depthInLayer = layer.ThicknessMm;
+                fullyPenetrated = true;
+                remainingTime -= timeToTraverse;
+            }
+            else
+            {
+                double partialDepthM = Math.Sqrt(kEffective * remainingTime);
+                depthInLayer = partialDepthM * 1000.0;
+                fullyPenetrated = false;
+                remainingTime = 0;
+            }
+
+            result.Add(new LayerPenetrationInfo
+            {
+                LayerName = layer.LayerName,
+                DepthInLayerMm = Math.Round(depthInLayer, 4),
+                TimeToTraverseSeconds = Math.Round(timeToTraverse, 2),
+                LayerPorosity = layer.Porosity,
+                LayerPoreRadiusNm = layer.PoreRadiusNm,
+                FullyPenetrated = fullyPenetrated
+            });
+
+            if (!fullyPenetrated) break;
+        }
+
+        return result.ToArray();
+    }
+
+    private (double[] DepthProfile, double[] TimePoints) GenerateLayeredDepthProfile(
+        double t, double gamma, double theta, double eta, SculptureLayer[] layers)
+    {
+        int timeSteps = 50;
+        double totalThickness = layers.Sum(l => l.ThicknessMm);
+        double timeToFull = CalculateLayeredTimeToTargetDepth(totalThickness, gamma, theta, eta, layers);
+        double maxTime = Math.Max(t, timeToFull * 1.5);
+
+        var timePoints = new double[timeSteps];
+        var depthProfile = new double[timeSteps];
+
+        for (int i = 0; i < timeSteps; i++)
+        {
+            timePoints[i] = (i + 1) * maxTime / timeSteps;
+            depthProfile[i] = CalculateLayeredLucasWashburn(timePoints[i], gamma, theta, eta, layers);
+        }
+
+        return (depthProfile, timePoints);
+    }
+
+    private double CalculateLayeredTimeToTargetDepth(double targetDepthMm, double gamma, double theta, double eta, SculptureLayer[] layers)
+    {
+        double cosTheta = Math.Cos(theta);
+        if (cosTheta <= 0) return double.PositiveInfinity;
+
+        double remainingDepth = targetDepthMm;
+        double totalTime = 0;
+
+        foreach (var layer in layers)
+        {
+            if (remainingDepth <= 0) break;
+
+            double r = layer.PoreRadiusNm * 1e-9;
+            double phi = layer.Porosity;
+            double tau = layer.Tortuosity;
+
+            double numerator = gamma * cosTheta * r;
+            double denominator = 2.0 * eta * phi * tau;
+            double kEffective = numerator / Math.Max(denominator, 1e-20);
+
+            double depthInLayer = Math.Min(remainingDepth, layer.ThicknessMm);
+            double depthM = depthInLayer / 1000.0;
+            totalTime += (depthM * depthM) / Math.Max(kEffective, 1e-20);
+
+            remainingDepth -= depthInLayer;
+        }
+
+        return totalTime;
     }
 }
 
