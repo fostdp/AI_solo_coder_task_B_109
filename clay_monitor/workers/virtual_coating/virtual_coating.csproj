@@ -7,6 +7,10 @@
     <AssemblyName>virtual_coating</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="2.88.8" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.8" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\ClayMonitor.Core\ClayMonitor.Core.csproj" />
     <ProjectReference Include="..\washburn_penetration\washburn_penetration.csproj" />
   </ItemGroup>
