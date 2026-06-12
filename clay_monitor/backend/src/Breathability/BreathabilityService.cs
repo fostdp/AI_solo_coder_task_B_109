@@ -6,6 +6,15 @@ using Microsoft.Extensions.Options;
 
 namespace ClayMonitor.Breathability;
 
+public record SensorAccuracyConfig
+{
+    public double TemperatureAccuracyC { get; init; } = 0.3;
+    public double HumidityAccuracyPercent { get; init; } = 2.0;
+    public double SensorResponseTimeSeconds { get; init; } = 15.0;
+    public double HysteresisErrorPercent { get; init; } = 1.5;
+    public bool ApplyCorrection { get; init; } = true;
+}
+
 public record BreathabilityInput
 {
     public int SculptureId { get; init; }
@@ -15,6 +24,7 @@ public record BreathabilityInput
     public double Porosity { get; init; } = 0.35;
     public double MoistureContent { get; init; } = 0.25;
     public int AnalysisWindowHours { get; init; } = 24;
+    public SensorAccuracyConfig? SensorAccuracy { get; init; }
 }
 
 public record BreathabilityResult
@@ -37,6 +47,10 @@ public record BreathabilityResult
     public int DesorptionCycles { get; init; }
     public double AverageCycleDurationMinutes { get; init; }
     public DateTime CalculatedAt { get; init; } = DateTime.Now;
+    public bool SensorLagCorrectionApplied { get; init; }
+    public double CorrectedTimeLagMinutes { get; init; }
+    public double SensorLagContributionMinutes { get; init; }
+    public double RawUncertaintyPercent { get; init; }
 }
 
 public record BreathabilityAssessment
@@ -56,6 +70,8 @@ public interface IBreathabilityService
     double CalculateBreathFrequency(double[] humidity, DateTime[] timestamps);
     double CalculateTimeLag(double[] temperature, double[] humidity, DateTime[] timestamps);
     double CalculateHysteresisArea(double[] humidity, double[] moisture);
+    double[] ApplySensorLagCorrection(double[] signal, DateTime[] timestamps, double responseTimeSeconds);
+    double CalculateSensorLagContribution(double[] timestamps, double sensorResponseTimeSeconds);
 }
 
 public class BreathabilityService : BackgroundService, IBreathabilityService
@@ -160,26 +176,51 @@ public class BreathabilityService : BackgroundService, IBreathabilityService
         double[] RH = input.Humidities;
         DateTime[] t = input.Timestamps;
 
-        double tempAmp = CalculateAmplitude(T);
-        double humAmp = CalculateAmplitude(RH);
+        var sensorCfg = input.SensorAccuracy ?? new SensorAccuracyConfig();
+        bool applyCorrection = sensorCfg.ApplyCorrection;
 
-        double breathFreq = CalculateBreathFrequency(RH, t);
-        double breathIntensity = CalculateBreathIntensity(RH, t);
-        double timeLag = CalculateTimeLag(T, RH, t);
+        double[] correctedT = T;
+        double[] correctedRH = RH;
+        double sensorLagContribution = 0;
+        double correctedTimeLag;
+
+        if (applyCorrection)
+        {
+            correctedT = ApplySensorLagCorrection(T, t, sensorCfg.SensorResponseTimeSeconds);
+            correctedRH = ApplySensorLagCorrection(RH, t, sensorCfg.SensorResponseTimeSeconds);
+            sensorLagContribution = CalculateSensorLagContribution(t, sensorCfg.SensorResponseTimeSeconds);
+        }
+
+        double tempAmp = CalculateAmplitude(correctedT);
+        double humAmp = CalculateAmplitude(correctedRH);
+
+        double breathFreq = CalculateBreathFrequency(correctedRH, t);
+        double breathIntensity = CalculateBreathIntensity(correctedRH, t);
+        double timeLag = CalculateTimeLag(correctedT, correctedRH, t);
+        correctedTimeLag = applyCorrection ? Math.Max(0, timeLag - sensorLagContribution) : timeLag;
 
         int absCycles, desCycles;
-        double avgCycleDuration = CalculateCycleDuration(RH, t, out absCycles, out desCycles);
+        double avgCycleDuration = CalculateCycleDuration(correctedRH, t, out absCycles, out desCycles);
 
         double[] sorption, desorption;
-        double hysteresisArea = CalculateHysteresis(T, RH, input.MoistureContent, out sorption, out desorption);
+        double hysteresisArea = CalculateHysteresis(correctedT, correctedRH, input.MoistureContent, out sorption, out desorption);
+
+        if (applyCorrection)
+        {
+            double hystError = sensorCfg.HysteresisErrorPercent / 100.0;
+            hysteresisArea = Math.Max(0, hysteresisArea * (1.0 - hystError * 0.5));
+        }
 
         double moistureBuffer = CalculateMoistureBufferCapacity(humAmp, input.Porosity, input.MoistureContent);
         double selfRegScore = CalculateSelfRegulationScore(
-            breathFreq, breathIntensity, timeLag, hysteresisArea, moistureBuffer, tempAmp);
+            breathFreq, breathIntensity, correctedTimeLag, hysteresisArea, moistureBuffer, tempAmp);
+
+        double uncertainty = CalculateMeasurementUncertainty(
+            sensorCfg, tempAmp, humAmp, correctedTimeLag);
 
         string regulationLevel = ClassifyRegulationLevel(selfRegScore);
-        string assessment = GenerateAssessment(breathFreq, breathIntensity, timeLag, selfRegScore, tempAmp, humAmp);
-        string recommendation = GenerateRecommendation(regulationLevel, breathFreq, timeLag);
+        string assessment = GenerateAssessment(breathFreq, breathIntensity, correctedTimeLag, selfRegScore, tempAmp, humAmp);
+        string recommendation = GenerateRecommendation(regulationLevel, breathFreq, correctedTimeLag);
 
         return await Task.FromResult(new BreathabilityResult
         {
@@ -200,8 +241,64 @@ public class BreathabilityService : BackgroundService, IBreathabilityService
             AbsorptionCycles = absCycles,
             DesorptionCycles = desCycles,
             AverageCycleDurationMinutes = Math.Round(avgCycleDuration, 2),
-            CalculatedAt = DateTime.Now
+            CalculatedAt = DateTime.Now,
+            SensorLagCorrectionApplied = applyCorrection,
+            CorrectedTimeLagMinutes = Math.Round(correctedTimeLag, 2),
+            SensorLagContributionMinutes = Math.Round(sensorLagContribution, 2),
+            RawUncertaintyPercent = Math.Round(uncertainty, 2)
         });
+    }
+
+    public double[] ApplySensorLagCorrection(double[] signal, DateTime[] timestamps, double responseTimeSeconds)
+    {
+        if (signal.Length < 2 || responseTimeSeconds <= 0)
+            return (double[])signal.Clone();
+
+        int n = signal.Length;
+        var corrected = new double[n];
+        corrected[0] = signal[0];
+
+        double tau = Math.Max(responseTimeSeconds, 1.0);
+
+        for (int i = 1; i < n; i++)
+        {
+            double dt = (timestamps[i] - timestamps[i - 1]).TotalSeconds;
+            if (dt <= 0)
+            {
+                corrected[i] = corrected[i - 1];
+                continue;
+            }
+
+            double alpha = 1.0 - Math.Exp(-dt / tau);
+            double measuredRate = (signal[i] - signal[i - 1]) / dt;
+            double trueRate = measuredRate / Math.Max(alpha, 1e-6);
+            corrected[i] = corrected[i - 1] + trueRate * dt;
+        }
+
+        return corrected;
+    }
+
+    public double CalculateSensorLagContribution(double[] timestamps, double sensorResponseTimeSeconds)
+    {
+        if (timestamps.Length < 2) return 0;
+
+        double avgIntervalMinutes = (timestamps.Last() - timestamps.First()).TotalMinutes / (timestamps.Length - 1);
+        double responseMinutes = sensorResponseTimeSeconds / 60.0;
+
+        double expectedLagRatio = responseMinutes / Math.Max(avgIntervalMinutes, 0.1);
+        return Math.Min(responseMinutes * 0.8, avgIntervalMinutes * expectedLagRatio * 0.5);
+    }
+
+    private double CalculateMeasurementUncertainty(
+        SensorAccuracyConfig cfg, double tempAmp, double humAmp, double timeLag)
+    {
+        double tempUncertainty = cfg.TemperatureAccuracyC / Math.Max(tempAmp, 0.1) * 100.0;
+        double humUncertainty = cfg.HumidityAccuracyPercent / Math.Max(humAmp, 0.1) * 100.0;
+        double lagUncertainty = cfg.SensorResponseTimeSeconds / 60.0 / Math.Max(timeLag, 1.0) * 100.0;
+
+        return Math.Clamp(Math.Sqrt(tempUncertainty * tempUncertainty
+                                    + humUncertainty * humUncertainty
+                                    + lagUncertainty * lagUncertainty) / Math.Sqrt(3), 0, 50);
     }
 
     public double CalculateBreathFrequency(double[] humidity, DateTime[] timestamps)
